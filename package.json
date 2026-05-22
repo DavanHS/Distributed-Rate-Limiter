@@ -1,0 +1,42 @@
+{
+  "name": "@davanhs/rate-limiter",
+  "version": "0.1.0",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./hono": {
+      "types": "./dist/hono.d.ts",
+      "import": "./dist/hono.js",
+      "require": "./dist/hono.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts src/hono.ts --outdir dist --target node --format esm --external hono --external ioredis --external zod && bun build src/index.ts --outfile dist/index.cjs --target node --format cjs --external hono --external ioredis --external zod && bun build src/hono.ts --outfile dist/hono.cjs --target node --format cjs --external hono --external ioredis --external zod && tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ioredis": "^5.0.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "hono": "^4.12.18",
+    "ioredis": "^5.10.1",
+    "zod": "^4.4.3"
+  }
+}

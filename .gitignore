@@ -1,0 +1,8 @@
+node_modules
+dist
+bun.lockb
+.env
+.agents/
+.codex/
+issues/
+PRD.md 
