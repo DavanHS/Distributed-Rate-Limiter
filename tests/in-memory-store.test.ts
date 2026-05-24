@@ -25,6 +25,7 @@ describe("InMemoryStore", () => {
 
       expect(result).toEqual({
         allowed: true,
+        limit: 500,
         remaining: 499,
         resetTime: 1_700_000_001_000,
         retryAfter: 0,
@@ -46,16 +47,16 @@ describe("InMemoryStore", () => {
     });
   });
 
-  test("normalizes keys with lowercase, trim, and rl prefix", async () => {
+  test("keeps opaque keys exact with rl prefix", async () => {
     const store = new InMemoryStore({ burst: 1, refillRate: 1, refillInterval: 60_000 });
 
     await withMockedNow(1_700_000_000_000, async () => {
       expect(await store.check("  USER:42  ")).toMatchObject({ allowed: true });
-      expect(await store.check("user:42")).toMatchObject({ allowed: false });
+      expect(await store.check("user:42")).toMatchObject({ allowed: true });
     });
 
     const internals = store as unknown as StoreInternals;
-    expect([...internals.store.keys()]).toEqual(["rl:user:42"]);
+    expect([...internals.store.keys()]).toEqual(["rl:  USER:42  ", "rl:user:42"]);
   });
 
   test("cleans expired entries even when they appear after non-expired entries", async () => {

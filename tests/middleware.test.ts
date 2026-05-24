@@ -1,11 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import { createRateLimiter, type RateLimiterLogger } from "../src/middleware";
-import type { CheckResult, RateLimitRequest } from "../src/types";
+import type { CheckResult } from "../src/types";
 import type { RateLimitStore } from "../src/store";
-
-function request(ip = "203.0.113.10"): RateLimitRequest {
-  return { headers: new Headers(), ip };
-}
 
 function storeReturning(result: CheckResult): RateLimitStore {
   return {
@@ -14,29 +10,32 @@ function storeReturning(result: CheckResult): RateLimitStore {
 }
 
 describe("createRateLimiter", () => {
-  test("validates options at initialization", () => {
+  test("creates middleware without duplicate rate options", () => {
     const store = storeReturning({
       allowed: true,
+      limit: 500,
       remaining: 499,
       resetTime: 1_700_000_000_000,
       retryAfter: 0,
     });
 
-    expect(() => createRateLimiter(store, { burst: -1 })).toThrow();
+    expect(() => createRateLimiter(store)).not.toThrow();
   });
 
   test("passes allowed requests to next and sets rate limit headers", async () => {
     const store = storeReturning({
       allowed: true,
+      limit: 20,
       remaining: 12,
       resetTime: 1_700_000_000_000,
       retryAfter: 0,
     });
-    const limiter = createRateLimiter(store, { burst: 20 });
+    const limiter = createRateLimiter(store);
     const next = mock(async () => new Response("ok"));
 
-    const response = await limiter(request(), next);
+    const response = await limiter("client", next);
 
+    expect(store.check).toHaveBeenCalledWith("client");
     expect(next).toHaveBeenCalledTimes(1);
     expect(response?.status).toBe(200);
     expect(await response?.text()).toBe("ok");
@@ -50,15 +49,16 @@ describe("createRateLimiter", () => {
     Date.now = () => 1_700_000_000_000;
     const store = storeReturning({
       allowed: false,
+      limit: 20,
       remaining: 0,
       resetTime: 1_700_000_000_000,
       retryAfter: 1_700_000_001_000,
     });
-    const limiter = createRateLimiter(store, { burst: 20 });
+    const limiter = createRateLimiter(store);
     const next = mock(async () => new Response("ok"));
 
     try {
-      const response = await limiter(request(), next);
+      const response = await limiter("client", next);
 
       expect(next).not.toHaveBeenCalled();
       expect(response?.status).toBe(429);
@@ -75,20 +75,6 @@ describe("createRateLimiter", () => {
     }
   });
 
-  test("uses custom keyResolver before checking store", async () => {
-    const store = storeReturning({
-      allowed: true,
-      remaining: 1,
-      resetTime: 1_700_000_000_000,
-      retryAfter: 0,
-    });
-    const limiter = createRateLimiter(store, { keyResolver: () => "  USER:42  " });
-
-    await limiter(request(), async () => new Response("ok"));
-
-    expect(store.check).toHaveBeenCalledWith("user:42");
-  });
-
   test("fails open when runtime rate limiter work throws", async () => {
     const store: RateLimitStore = {
       check: mock(async () => {
@@ -96,10 +82,10 @@ describe("createRateLimiter", () => {
       }),
     };
     const logger: RateLimiterLogger = { warn: mock() };
-    const limiter = createRateLimiter(store, {}, logger);
+    const limiter = createRateLimiter(store, logger);
     const next = mock(async () => new Response("ok"));
 
-    const response = await limiter(request(), next);
+    const response = await limiter("client", next);
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(logger.warn).toHaveBeenCalledTimes(1);

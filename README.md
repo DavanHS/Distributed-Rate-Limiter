@@ -5,6 +5,7 @@ Production-grade distributed rate limiting for Bun, Hono, and Fetch-style applic
 - **Token bucket algorithm** — handles bursty + steady traffic
 - **Pluggable stores** — in-memory (single node) or Redis (distributed)
 - **Framework-agnostic core** — Hono adapter built-in, extensible to any framework
+- **Signed cookie identity** — Hono adapter issues tamper-proof opaque client IDs
 - **Zero-config defaults** — works out of the box, configurable when you need it
 - **Fail-open** — Redis goes down? Your API stays up
 
@@ -25,12 +26,13 @@ import { createHonoMiddleware } from "@davanhs/rate-limiter/hono";
 
 const app = new Hono();
 
-const store = new RedisStore({ redisUrl: "redis://localhost:6379" });
-const limiter = createRateLimiter(store, {
+const store = new RedisStore({
+  redisUrl: process.env.REDIS_URL!,
   burst: 500,
   refillRate: 50,
   refillInterval: 1000,
 });
+const limiter = createRateLimiter(store);
 
 app.use("*", createHonoMiddleware(limiter));
 app.get("/", (c) => c.text("Hello!"));
@@ -62,12 +64,9 @@ const store = new InMemoryStore();
 const limiter = createRateLimiter(store);
 
 async function handler(request: Request) {
-  const req = {
-    headers: request.headers,
-    ip: request.headers.get("x-forwarded-for") ?? "unknown",
-  };
+  const key = request.headers.get("x-client-id") ?? crypto.randomUUID();
 
-  const response = await limiter(req, () => undefined);
+  const response = await limiter(key, () => undefined);
   if (response) return response; // 429
 
   return new Response("Hello!");
@@ -83,33 +82,28 @@ async function handler(request: Request) {
 | `burst` | `number` | `500` | Maximum token bucket capacity |
 | `refillRate` | `number` | `50` | Tokens added per refill interval |
 | `refillInterval` | `number` (ms) | `1000` | Milliseconds between refills |
-| `keyResolver` | `KeyResolver` | IP-based | Custom key resolution function |
 | `redisUrl` | `string` (URL) | — | Redis connection URL (required for `RedisStore`) |
 
-### Custom Key Resolver
+Rate limit options belong to the store. `createRateLimiter(store)` does not accept duplicate rate policy.
 
-Rate limit by API key, user ID, session, or anything else:
+### Environment
 
-```ts
-const limiter = createRateLimiter(store, {
-  keyResolver: (req) => req.headers.get("authorization"),
-});
+Set the signing secret yourself. The package only reads it.
+
+```env
+REDIS_URL=redis://localhost:6379
+RATE_LIMIT_COOKIE_SECRET=replace-with-a-long-random-secret
 ```
 
-If your resolver throws, returns `null`/`undefined`/empty string, the limiter logs a warning and falls back to IP-based resolution. Your API stays protected even when custom key resolution fails.
+### Hono Cookie Identity
 
-### Custom IP Extraction (Hono)
+The Hono adapter reads and writes one fixed signed session cookie:
 
-```ts
-app.use(
-  "*",
-  createHonoMiddleware(limiter, {
-    getIp: (c) => c.req.header("cf-connecting-ip"),
-  })
-);
-```
-
-IP resolution fallback chain: `getIp()` → `x-real-ip` → `cf-connecting-ip` → `x-forwarded-for` (first IP) → `"unknown"`.
+- Env secret: `RATE_LIMIT_COOKIE_SECRET` (required)
+- Cookie name: `__rl_id`
+- Attributes: `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`
+- Missing or invalid cookie: new opaque ID is generated and signed
+- No IP fallback and no app-provided key resolver in v1
 
 ## Stores
 
@@ -130,57 +124,45 @@ Distributed rate limiting with atomic Lua script execution.
 ```ts
 import { RedisStore } from "@davanhs/rate-limiter";
 
-const store = new RedisStore({ redisUrl: "redis://localhost:6379" });
+const store = new RedisStore({
+  redisUrl: "redis://localhost:6379",
+  burst: 100,
+  refillRate: 10,
+  refillInterval: 1000,
+});
 ```
 
 **Features:**
 - Atomic token bucket via Lua script (no race conditions)
 - `SCRIPT LOAD` / `EVALSHA` with `EVAL` fallback
 - Redis `TIME` command for server-clock timestamps, falls back to `Date.now()`
-- Key format: `rl:<normalizedKey>` (hash with `tokens` + `lastRefill`, TTL = 2× refill interval)
+- Key format: `rl:<opaqueKey>` (hash with `tokens` + `lastRefill`, TTL = 2× refill interval)
+- Keys are exact opaque values; they are not lowercased, trimmed, or normalized
 - Fail-open on runtime errors (logs warning, allows request)
 - Throws `RedisLimiterInitError` on startup failure (bad URL, connection refused)
 
-**Inject your own Redis client:**
-
-```ts
-import Redis from "ioredis";
-import { RedisStore } from "@davanhs/rate-limiter";
-
-const client = new Redis("redis://localhost:6379");
-const store = new RedisStore({ redisUrl: "redis://localhost:6379" }, client);
-```
-
 ## API Reference
 
-### `createRateLimiter(store, options?, logger?)`
+### `createRateLimiter(store, logger?)`
 
 Factory function that returns a `RateLimitMiddleware`:
 
 ```ts
 type RateLimitMiddleware = (
-  req: RateLimitRequest,
+  key: string,
   next: RateLimitNext
 ) => Promise<Response | undefined>;
 ```
 
-- Returns `undefined` if the request is allowed (call `next()`)
+- Calls `next()` if the request is allowed
 - Returns a `Response` with status 429 if the request is denied
-
-### `RateLimitRequest`
-
-```ts
-interface RateLimitRequest {
-  headers: HeaderSource; // Headers, { get(name) }, or Record<string, string | string[] | undefined>
-  ip: string;
-}
-```
 
 ### `CheckResult`
 
 ```ts
 interface CheckResult {
   allowed: boolean;
+  limit: number; // Burst capacity
   remaining: number; // 0 when exhausted
   resetTime: number; // Absolute Unix epoch ms
   retryAfter: number; // Absolute Unix epoch ms (0 when allowed)
@@ -209,13 +191,12 @@ interface CheckResult {
 | Error Class | When |
 |---|---|
 | `RateLimiterError` | Base class for all rate limiter errors |
-| `KeyResolverError` | Defined for extensibility (fallback used instead of throwing) |
 | `RedisLimiterInitError` | Thrown on RedisStore initialization failure |
 
 **Runtime behavior:**
 - Invalid config at init → throws (developer error, catch early)
 - Redis connection lost → fail-open (log + allow request)
-- Key resolver throws → fallback to IP + warn
+- Missing or invalid Hono cookie → new signed identity
 
 ## Local Development
 
@@ -256,12 +237,12 @@ bun run build
 │                   Your App                      │
 │  ┌───────────────────────────────────────────┐  │
 │  │          Hono Adapter (hono.ts)           │  │
-│  │  Converts Hono Context → RateLimitRequest │  │
+│  │ Reads/signs cookie → passes opaque key    │  │
 │  └──────────────────┬────────────────────────┘  │
 │                     │                           │
 │  ┌──────────────────▼────────────────────────┐  │
 │  │       Middleware (middleware.ts)          │  │
-│  │  resolveKey → store.check → 429 or next() │  │
+│  │       key → store.check → 429 or next()   │  │
 │  └──────────────────┬────────────────────────┘  │
 │                     │                           │
 │  ┌──────────────────┼────────────────────────┐  │

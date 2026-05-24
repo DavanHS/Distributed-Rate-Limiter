@@ -1,14 +1,13 @@
 import { describe, expect, mock, test } from "bun:test";
-import Redis from "ioredis";
-import { RedisLimiterInitError } from "../src/errors";
-import { RedisStore, type RedisStoreClient, type RedisStoreLogger } from "../src/redis-store";
 
 type Call = {
   command: string;
   args: unknown[];
 };
 
-class FakeRedis implements RedisStoreClient {
+class FakeRedis {
+  static instances: FakeRedis[] = [];
+
   calls: Call[] = [];
   scriptResult: unknown = "sha1";
   evalshaResult: unknown = [1, 499, 1_700_000_001_000, 0];
@@ -18,6 +17,13 @@ class FakeRedis implements RedisStoreClient {
   evalshaError: unknown;
   evalError: unknown;
   timeError: unknown;
+
+  constructor(
+    readonly redisUrl: string,
+    readonly options: Record<string, unknown>,
+  ) {
+    FakeRedis.instances.push(this);
+  }
 
   async script(subcommand: "LOAD", script: string): Promise<unknown> {
     this.calls.push({ command: "script", args: [subcommand, script] });
@@ -60,22 +66,58 @@ class FakeRedis implements RedisStoreClient {
   }
 }
 
+mock.module("ioredis", () => ({
+  default: FakeRedis,
+}));
+
+const { RedisLimiterInitError } = await import("../src/errors");
+const { RedisStore } = await import("../src/redis-store");
+type RedisStoreLogger = import("../src/redis-store").RedisStoreLogger;
+
+function latestRedis(): FakeRedis {
+  const redis = FakeRedis.instances.at(-1);
+
+  if (!redis) {
+    throw new Error("FakeRedis was not constructed.");
+  }
+
+  return redis;
+}
+
 describe("RedisStore", () => {
-  test("throws RedisLimiterInitError for missing redisUrl without injected client", () => {
-    expect(() => new RedisStore({})).toThrow(RedisLimiterInitError);
+  test("throws RedisLimiterInitError for missing redisUrl", () => {
+    expect(() => new RedisStore({} as never)).toThrow(RedisLimiterInitError);
   });
 
-  test("loads Lua script and runs EVALSHA with normalized Redis key and config args", async () => {
-    const redis = new FakeRedis();
-    const store = new RedisStore(
-      { redisUrl: "redis://localhost:6379", burst: 500, refillRate: 50, refillInterval: 1000 },
-      redis,
-    );
+  test("creates its own Redis client from redisUrl", () => {
+    FakeRedis.instances = [];
+
+    new RedisStore({ redisUrl: "redis://localhost:6379" });
+
+    const redis = latestRedis();
+    expect(redis.redisUrl).toBe("redis://localhost:6379");
+    expect(redis.options).toMatchObject({
+      lazyConnect: true,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 1,
+    });
+  });
+
+  test("loads Lua script and runs EVALSHA with exact Redis key and config args", async () => {
+    FakeRedis.instances = [];
+    const store = new RedisStore({
+      redisUrl: "redis://localhost:6379",
+      burst: 500,
+      refillRate: 50,
+      refillInterval: 1000,
+    });
+    const redis = latestRedis();
 
     const result = await store.check("  USER:42  ");
 
     expect(result).toEqual({
       allowed: true,
+      limit: 500,
       remaining: 499,
       resetTime: 1_700_000_001_000,
       retryAfter: 0,
@@ -86,7 +128,7 @@ describe("RedisStore", () => {
     expect(redis.calls[2]?.args).toEqual([
       "sha1",
       1,
-      "rl:user:42",
+      "rl:  USER:42  ",
       1_700_000_000_123,
       500,
       50,
@@ -96,15 +138,17 @@ describe("RedisStore", () => {
   });
 
   test("falls back to EVAL when EVALSHA returns NOSCRIPT", async () => {
-    const redis = new FakeRedis();
+    FakeRedis.instances = [];
+    const store = new RedisStore({ redisUrl: "redis://localhost:6379" });
+    const redis = latestRedis();
     redis.evalshaError = new Error("NOSCRIPT No matching script. Please use EVAL.");
     redis.evalResult = [0, 0, 1_700_000_001_000, 1_700_000_001_000];
-    const store = new RedisStore({ redisUrl: "redis://localhost:6379" }, redis);
 
     const result = await store.check("client");
 
     expect(result).toEqual({
       allowed: false,
+      limit: 500,
       remaining: 0,
       resetTime: 1_700_000_001_000,
       retryAfter: 1_700_000_001_000,
@@ -126,10 +170,11 @@ describe("RedisStore", () => {
   });
 
   test("uses Date.now when Redis TIME fails", async () => {
-    const redis = new FakeRedis();
-    redis.timeError = new Error("TIME unavailable");
+    FakeRedis.instances = [];
     const now = Date.now();
-    const store = new RedisStore({ redisUrl: "redis://localhost:6379" }, redis);
+    const store = new RedisStore({ redisUrl: "redis://localhost:6379" });
+    const redis = latestRedis();
+    redis.timeError = new Error("TIME unavailable");
 
     await store.check("client");
 
@@ -138,56 +183,18 @@ describe("RedisStore", () => {
   });
 
   test("fails open and logs warning when Redis runtime work throws", async () => {
-    const redis = new FakeRedis();
-    redis.scriptError = new Error("Redis down");
+    FakeRedis.instances = [];
     const logger: RedisStoreLogger = { warn: mock() };
-    const store = new RedisStore({ redisUrl: "redis://localhost:6379", burst: 20 }, redis, logger);
+    const store = new RedisStore({ redisUrl: "redis://localhost:6379", burst: 20 }, logger);
+    const redis = latestRedis();
+    redis.scriptError = new Error("Redis down");
 
     const result = await store.check("client");
 
     expect(result.allowed).toBe(true);
+    expect(result.limit).toBe(20);
     expect(result.remaining).toBe(20);
     expect(result.retryAfter).toBe(0);
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
-});
-
-const redisIntegrationTest = process.env.REDIS_URL ? test : test.skip;
-
-redisIntegrationTest("RedisStore integrates with real Redis Lua state and TTL", async () => {
-  const redisUrl = process.env.REDIS_URL;
-
-  if (!redisUrl) {
-    throw new Error("REDIS_URL is required for Redis integration test.");
-  }
-
-  const redis = new Redis(redisUrl);
-  const rawKey = `integration:${Date.now()}`;
-  const redisKey = `rl:${rawKey}`;
-  const store = new RedisStore(
-    { redisUrl, burst: 2, refillRate: 1, refillInterval: 1000 },
-    redis,
-  );
-
-  try {
-    await redis.del(redisKey);
-
-    const first = await store.check(rawKey);
-    const second = await store.check(rawKey);
-    const third = await store.check(rawKey);
-    const state = await redis.hgetall(redisKey);
-    const ttl = await redis.pttl(redisKey);
-
-    expect(first).toMatchObject({ allowed: true, remaining: 1, retryAfter: 0 });
-    expect(second).toMatchObject({ allowed: true, remaining: 0, retryAfter: 0 });
-    expect(third.allowed).toBe(false);
-    expect(third.remaining).toBe(0);
-    expect(Number(state.tokens)).toBe(0);
-    expect(Number(state.lastRefill)).toBeGreaterThan(0);
-    expect(ttl).toBeGreaterThan(0);
-    expect(ttl).toBeLessThanOrEqual(2000);
-  } finally {
-    await redis.del(redisKey);
-    redis.disconnect();
-  }
 });

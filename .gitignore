@@ -5,4 +5,6 @@ bun.lockb
 .agents/
 .codex/
 issues/
-PRD.md 
+PRD.md
+changes.md
+docs/
